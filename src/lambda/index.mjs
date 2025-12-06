@@ -30,6 +30,12 @@ const dynamodb = new DynamoDBClient({});
 const EC2_LOOKBACK_DAYS = 7;
 const EC2_IDLE_CPU_THRESHOLD = 5; // percent
 
+// --- DynamoDb config/pricing (approx, us-east/us-west standard on-demand) ---
+const DDB_LOOKBACK_DAYS = 30;
+const DDB_READ_PRICE_PER_MILLION = 0.25; // $/1M read request units
+const DDB_WRITE_PRICE_PER_MILLION = 1.25; // $/1M write request units
+const DDB_STORAGE_PRICE_PER_GB_MONTH = 0.25; // $/GB-month
+
 // --- Helpers ---
 
 /**
@@ -176,9 +182,35 @@ async function buildEc2Section() {
   return { text, estimatedMonthlyCost };
 }
 
-// --- Section 2: DynamoDB (tables inventory for now) ---
+// --- Section 2: DynamoDB (tables + estimated cost) ---
 
 async function buildDynamoSection() {
+  const endTime = new Date();
+  const startTime = new Date(
+    endTime.getTime() - DDB_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+  );
+
+  // Helper: get total consumed capacity (Sum of datapoints) for a metric
+  async function getDynamoCapacitySum(tableName, metricName) {
+    const cmd = new GetMetricStatisticsCommand({
+      Namespace: "AWS/DynamoDB",
+      MetricName: metricName, // "ConsumedReadCapacityUnits" or "ConsumedWriteCapacityUnits"
+      Dimensions: [{ Name: "TableName", Value: tableName }],
+      StartTime: startTime,
+      EndTime: endTime,
+      Period: 3600, // 1 hour buckets
+      Statistics: ["Sum"],
+    });
+
+    const resp = await cloudwatch.send(cmd);
+    const dps = resp.Datapoints ?? [];
+    if (dps.length === 0) return 0;
+
+    // Total units in the lookback window
+    const total = dps.reduce((acc, dp) => acc + (dp.Sum ?? 0), 0);
+    return total;
+  }
+
   // 1) List all tables (handle pagination)
   const allTableNames = [];
   let lastEvaluatedTableName = undefined;
@@ -197,6 +229,8 @@ async function buildDynamoSection() {
   console.log(`DynamoDB: found ${allTableNames.length} table(s).`);
 
   let text = "=== DynamoDB (Tables) ===\n";
+  text += `Lookback window (for usage): last ${DDB_LOOKBACK_DAYS} day(s)\n`;
+  text += `Pricing assumptions (Standard on-demand): reads $${DDB_READ_PRICE_PER_MILLION}/M, writes $${DDB_WRITE_PRICE_PER_MILLION}/M, storage $${DDB_STORAGE_PRICE_PER_GB_MONTH}/GB-month\n`;
   text += `Total tables: ${allTableNames.length}\n\n`;
 
   if (allTableNames.length === 0) {
@@ -204,7 +238,9 @@ async function buildDynamoSection() {
     return { text, estimatedMonthlyCost: 0 };
   }
 
-  // 2) Describe each table for basic stats
+  let totalDdbMonthlyCost = 0;
+
+  // 2) Describe each table + get usage metrics + estimate cost
   for (const tableName of allTableNames) {
     try {
       const descResp = await dynamodb.send(
@@ -214,33 +250,57 @@ async function buildDynamoSection() {
       if (!t) continue;
 
       const sizeBytes = t.TableSizeBytes ?? 0;
-      const sizeMB = sizeBytes / (1024 * 1024);
+      const sizeGB = sizeBytes / (1024 * 1024 * 1024);
       const itemCount = t.ItemCount ?? 0;
       const billingMode =
         t.BillingModeSummary?.BillingMode ?? "PROVISIONED";
 
-      const rcu = t.ProvisionedThroughput?.ReadCapacityUnits;
-      const wcu = t.ProvisionedThroughput?.WriteCapacityUnits;
+      // Usage: total consumed read/write capacity units in lookback
+      const totalReadUnits = await getDynamoCapacitySum(
+        tableName,
+        "ConsumedReadCapacityUnits"
+      );
+      const totalWriteUnits = await getDynamoCapacitySum(
+        tableName,
+        "ConsumedWriteCapacityUnits"
+      );
 
-      text += `- ${tableName} | items: ${itemCount} | size: ${sizeMB.toFixed(
+      // Scale from N-day window to "30-day month" estimate
+      const scaleToMonth = 30 / DDB_LOOKBACK_DAYS;
+      const estMonthlyReadUnits = totalReadUnits * scaleToMonth;
+      const estMonthlyWriteUnits = totalWriteUnits * scaleToMonth;
+
+      // Estimate cost components
+      const readsCost =
+        (estMonthlyReadUnits / 1_000_000) * DDB_READ_PRICE_PER_MILLION;
+      const writesCost =
+        (estMonthlyWriteUnits / 1_000_000) * DDB_WRITE_PRICE_PER_MILLION;
+      const storageCost = sizeGB * DDB_STORAGE_PRICE_PER_GB_MONTH;
+
+      const tableCost = readsCost + writesCost + storageCost;
+      totalDdbMonthlyCost += tableCost;
+
+      text += `- ${tableName} | items: ${itemCount} | size: ${sizeGB.toFixed(
+        3
+      )} GB | mode: ${billingMode}`;
+      text += ` | est monthly cost: $${tableCost.toFixed(2)} (reads $${readsCost.toFixed(
         2
-      )} MB | mode: ${billingMode}`;
-
-      if (billingMode === "PROVISIONED") {
-        text += ` (RCU: ${rcu ?? "?"}, WCU: ${wcu ?? "?"})`;
-      }
-
-      text += "\n";
+      )}, writes $${writesCost.toFixed(2)}, storage $${storageCost.toFixed(
+        2
+      )})\n`;
     } catch (err) {
-      console.error(`Failed to describe table ${tableName}:`, err);
-      text += `- ${tableName} | <error describing table>\n`;
+      console.error(`Failed to describe/estimate table ${tableName}:`, err);
+      text += `- ${tableName} | <error describing or estimating cost>\n`;
     }
   }
 
-  // Cost estimation for DynamoDB will be added in the next step.
-  const estimatedMonthlyCost = 0;
+  text += `\nEstimated DynamoDB monthly total (all tables): $${totalDdbMonthlyCost.toFixed(
+    2
+  )}\n`;
+  text +=
+    "(Note: based on consumed capacity + size; actual bill may differ, especially for PROVISIONED tables.)\n";
 
-  return { text, estimatedMonthlyCost };
+  return { text, estimatedMonthlyCost: totalDdbMonthlyCost };
 }
 
 // --- Main handler: call all sections, aggregate, report ---
