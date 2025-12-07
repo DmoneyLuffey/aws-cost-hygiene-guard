@@ -1,18 +1,45 @@
 // src/lambda/index.mjs
-// AWS Cost Hygiene Guard - v1.1
-// - Top services by UnblendedCost (last 7 days)
-// - Optional: Top COST_TAG_KEY tag values by UnblendedCost (last 7 days)
-// - Sends summary to Slack.
+// AWS Cost Hygiene Guard - v2
+// - Cost Explorer: actual UnblendedCost (last 7 days) by SERVICE and by COST_TAG_KEY
+// - Per-resource view (utilization) for EC2 instances + DynamoDB tables
+// - Sends combined summary to Slack using a bot token
 
-import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
+import {
+  CostExplorerClient,
+  GetCostAndUsageCommand,
+} from "@aws-sdk/client-cost-explorer";
 
-// Cost Explorer endpoint is in us-east-1
+import {
+  EC2Client,
+  DescribeInstancesCommand,
+} from "@aws-sdk/client-ec2";
+
+import {
+  CloudWatchClient,
+  GetMetricStatisticsCommand,
+} from "@aws-sdk/client-cloudwatch";
+
+import {
+  DynamoDBClient,
+  ListTablesCommand,
+  DescribeTableCommand,
+} from "@aws-sdk/client-dynamodb";
+
+// ---------- Clients ----------
+
+// Cost Explorer is only in us-east-1
 const ceClient = new CostExplorerClient({ region: "us-east-1" });
 
-// Env vars (set in Lambda console)
+// Region for resource/utilization scans comes from Lambda env (AWS_REGION)
+const ec2 = new EC2Client({});
+const cloudwatch = new CloudWatchClient({});
+const dynamodb = new DynamoDBClient({});
+
+// ---------- Env vars ----------
+
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
-const COST_TAG_KEY = process.env.COST_TAG_KEY || "Project"; // e.g. "Project", "Environment"
+const COST_TAG_KEY = process.env.COST_TAG_KEY || "Project"; // e.g. Project, Environment
 
 // ---------- Date helpers ----------
 
@@ -26,7 +53,9 @@ function formatDate(d) {
 // Last 7 full days [Start, End) in UTC
 function getLast7DaysRange() {
   const now = new Date();
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const end = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  );
   const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
   return {
     Start: formatDate(start),
@@ -34,7 +63,7 @@ function getLast7DaysRange() {
   };
 }
 
-// ---------- Cost Explorer helpers ----------
+// ---------- Cost Explorer helpers (actual $) ----------
 
 // 7-day UnblendedCost grouped by SERVICE
 async function getCostByServiceLast7Days() {
@@ -114,6 +143,246 @@ async function getCostByTagLast7Days(tagKey) {
   return { timePeriod, arr };
 }
 
+// ---------- CloudWatch helper for utilization ----------
+
+async function getMetricAggregate({
+  namespace,
+  metricName,
+  dimensions,
+  startTime,
+  endTime,
+  periodSeconds,
+  statistic = "Average", // or "Sum"
+}) {
+  const cmd = new GetMetricStatisticsCommand({
+    Namespace: namespace,
+    MetricName: metricName,
+    Dimensions: dimensions,
+    StartTime: startTime,
+    EndTime: endTime,
+    Period: periodSeconds,
+    Statistics: [statistic],
+  });
+
+  const resp = await cloudwatch.send(cmd);
+  const datapoints = resp.Datapoints ?? [];
+  if (datapoints.length === 0) return null;
+
+  const key = statistic;
+  const sum = datapoints.reduce((acc, dp) => acc + (dp[key] ?? 0), 0);
+  return sum / datapoints.length;
+}
+
+// ---------- EC2 per-instance utilization ----------
+
+const EC2_LOOKBACK_DAYS = 7;
+const EC2_IDLE_CPU_THRESHOLD = 5; // %
+
+async function buildEc2Section() {
+  const endTime = new Date();
+  const startTime = new Date(
+    endTime.getTime() - EC2_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+  );
+
+  const describeResp = await ec2.send(new DescribeInstancesCommand({}));
+
+  const runningInstances = [];
+
+  for (const reservation of describeResp.Reservations ?? []) {
+    for (const instance of reservation.Instances ?? []) {
+      if (instance.State?.Name !== "running") continue;
+      runningInstances.push({
+        instanceId: instance.InstanceId,
+        instanceType: instance.InstanceType,
+        az: instance.Placement?.AvailabilityZone,
+        launchTime: instance.LaunchTime,
+        tags: instance.Tags ?? [],
+      });
+    }
+  }
+
+  console.log(`EC2: found ${runningInstances.length} running instance(s).`);
+
+  const detailed = [];
+  for (const inst of runningInstances) {
+    const avgCpu = await getMetricAggregate({
+      namespace: "AWS/EC2",
+      metricName: "CPUUtilization",
+      dimensions: [{ Name: "InstanceId", Value: inst.instanceId }],
+      startTime,
+      endTime,
+      periodSeconds: 3600,
+      statistic: "Average",
+    });
+
+    detailed.push({ ...inst, avgCpu });
+  }
+
+  const idleInstances = detailed.filter(
+    (inst) =>
+      typeof inst.avgCpu === "number" &&
+      inst.avgCpu < EC2_IDLE_CPU_THRESHOLD
+  );
+
+  let text = "=== EC2 (Instances & CPU Utilization) ===\n";
+  text += `Lookback: last ${EC2_LOOKBACK_DAYS} day(s)\n`;
+  text += `Idle threshold: ${EC2_IDLE_CPU_THRESHOLD}% avg CPU\n`;
+  text += `Running instances: ${runningInstances.length}\n`;
+  text += `Idle candidates: ${idleInstances.length}\n\n`;
+
+  if (runningInstances.length === 0) {
+    text += "No running instances in this region.\n";
+    return text;
+  }
+
+  text += "Per-instance details:\n";
+  for (const inst of detailed) {
+    const nameTag =
+      inst.tags.find((t) => t.Key === "Name")?.Value ?? "<no-name>";
+    const cpuStr =
+      typeof inst.avgCpu === "number"
+        ? inst.avgCpu.toFixed(2) + "%"
+        : "n/a";
+    const idleFlag =
+      typeof inst.avgCpu === "number" &&
+      inst.avgCpu < EC2_IDLE_CPU_THRESHOLD
+        ? "IDLE?"
+        : "";
+
+    text += `- ${inst.instanceId} (${nameTag}) | ${inst.instanceType} | ${inst.az} | avg CPU: ${cpuStr} ${idleFlag}\n`;
+  }
+
+  text += "\n";
+  return text;
+}
+
+// ---------- DynamoDB per-table utilization ----------
+
+const DDB_LOOKBACK_DAYS = 7;
+// Approximate on-demand pricing (adjust for your region if you want)
+const DDB_READ_PRICE_PER_MILLION = 0.25;   // $ per 1M read request units
+const DDB_WRITE_PRICE_PER_MILLION = 1.25;  // $ per 1M write request units
+const DDB_STORAGE_PRICE_PER_GB_MONTH = 0.25; // $ per GB-month
+
+// ---------- DynamoDB per-table utilization + estimated cost ----------
+
+async function buildDynamoSection() {
+  const endTime = new Date();
+  const startTime = new Date(
+    endTime.getTime() - DDB_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+  );
+
+  // Sum capacity units over lookback window
+  async function getDynamoCapacitySum(tableName, metricName) {
+    const cmd = new GetMetricStatisticsCommand({
+      Namespace: "AWS/DynamoDB",
+      MetricName: metricName, // ConsumedReadCapacityUnits / ConsumedWriteCapacityUnits
+      Dimensions: [{ Name: "TableName", Value: tableName }],
+      StartTime: startTime,
+      EndTime: endTime,
+      Period: 3600, // 1 hour
+      Statistics: ["Sum"],
+    });
+
+    const resp = await cloudwatch.send(cmd);
+    const dps = resp.Datapoints ?? [];
+    if (dps.length === 0) return 0;
+
+    return dps.reduce((acc, dp) => acc + (dp.Sum ?? 0), 0);
+  }
+
+  const allTableNames = [];
+  let lastEvaluatedTableName = undefined;
+
+  do {
+    const listResp = await dynamodb.send(
+      new ListTablesCommand({
+        ExclusiveStartTableName: lastEvaluatedTableName,
+      })
+    );
+    const names = listResp.TableNames ?? [];
+    allTableNames.push(...names);
+    lastEvaluatedTableName = listResp.LastEvaluatedTableName;
+  } while (lastEvaluatedTableName);
+
+  console.log(`DynamoDB: found ${allTableNames.length} table(s).`);
+
+  let text = "=== DynamoDB (Tables, Capacity & Est. Cost) ===\n";
+  text += `Lookback: last ${DDB_LOOKBACK_DAYS} day(s)\n`;
+  text += `Pricing (approx, on-demand): reads $${DDB_READ_PRICE_PER_MILLION}/M, writes $${DDB_WRITE_PRICE_PER_MILLION}/M, storage $${DDB_STORAGE_PRICE_PER_GB_MONTH}/GB-month\n`;
+  text += `Total tables: ${allTableNames.length}\n\n`;
+
+  if (allTableNames.length === 0) {
+    text += "No DynamoDB tables in this region.\n";
+    return { text, estimatedMonthlyCost: 0 };
+  }
+
+  let totalDdbMonthlyCost = 0;
+
+  for (const tableName of allTableNames) {
+    try {
+      const descResp = await dynamodb.send(
+        new DescribeTableCommand({ TableName: tableName })
+      );
+      const t = descResp.Table;
+      if (!t) continue;
+
+      const sizeBytes = t.TableSizeBytes ?? 0;
+      const sizeGB = sizeBytes / (1024 * 1024 * 1024);
+      const itemCount = t.ItemCount ?? 0;
+      const billingMode =
+        t.BillingModeSummary?.BillingMode ?? "PROVISIONED";
+
+      // Usage in the lookback window
+      const totalReadUnits = await getDynamoCapacitySum(
+        tableName,
+        "ConsumedReadCapacityUnits"
+      );
+      const totalWriteUnits = await getDynamoCapacitySum(
+        tableName,
+        "ConsumedWriteCapacityUnits"
+      );
+
+      // Scale from N-day window up to a 30-day month estimate
+      const scaleToMonth = 30 / DDB_LOOKBACK_DAYS;
+      const estMonthlyReadUnits = totalReadUnits * scaleToMonth;
+      const estMonthlyWriteUnits = totalWriteUnits * scaleToMonth;
+
+      const readsCost =
+        (estMonthlyReadUnits / 1_000_000) * DDB_READ_PRICE_PER_MILLION;
+      const writesCost =
+        (estMonthlyWriteUnits / 1_000_000) * DDB_WRITE_PRICE_PER_MILLION;
+      const storageCost = sizeGB * DDB_STORAGE_PRICE_PER_GB_MONTH;
+
+      const tableCost = readsCost + writesCost + storageCost;
+      totalDdbMonthlyCost += tableCost;
+
+      text += `- ${tableName} | items: ${itemCount} | size: ${sizeGB.toFixed(
+        3
+      )} GB | mode: ${billingMode}`;
+      text += ` | read units: ${totalReadUnits.toFixed(
+        0
+      )}, write units: ${totalWriteUnits.toFixed(0)}`;
+      text += ` | est monthly cost: $${tableCost.toFixed(2)} (reads $${readsCost.toFixed(
+        2
+      )}, writes $${writesCost.toFixed(2)}, storage $${storageCost.toFixed(
+        2
+      )})\n`;
+    } catch (err) {
+      console.error(`Failed to describe/measure table ${tableName}:`, err);
+      text += `- ${tableName} | <error describing or reading metrics>\n`;
+    }
+  }
+
+  text += `\nEstimated DynamoDB monthly total (all tables): $${totalDdbMonthlyCost.toFixed(
+    2
+  )}\n`;
+  text +=
+    "(Estimate based on consumed capacity + size; actual bill may differ, especially for PROVISIONED tables.)\n\n";
+
+  return { text, estimatedMonthlyCost: totalDdbMonthlyCost };
+}
+
 // ---------- Slack helper ----------
 
 async function postToSlack(text) {
@@ -122,18 +391,16 @@ async function postToSlack(text) {
     return;
   }
 
-  const payload = {
-    channel: SLACK_CHANNEL_ID,
-    text,
-  };
-
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      channel: SLACK_CHANNEL_ID,
+      text,
+    }),
   });
 
   const data = await res.json();
@@ -146,18 +413,35 @@ async function postToSlack(text) {
 
 // ---------- Lambda handler ----------
 
-// Handler path: src/lambda/index.handler
 export const handler = async (event, context) => {
   try {
-    // 1) Core: by SERVICE
+    // 1) Billing view – actual $ by SERVICE
     const { timePeriod, arr } = await getCostByServiceLast7Days();
     const topServices = arr.slice(0, 10);
 
-    console.log("=== AWS COST HYGIENE GUARD - Top services (last 7 days) ===");
-    console.log(`Range (UTC): ${timePeriod.Start} to ${timePeriod.End} (End exclusive)`);
-    for (const entry of topServices) {
-      console.log(`${entry.service.padEnd(40)} $${entry.amount.toFixed(4)}`);
+    // 2) Resource view – utilization details (EC2 + DynamoDB)
+    let resourceDetails = "";
+    let ddbEstimatedMonthlyCost = null;
+
+    try {
+      const ec2Text = await buildEc2Section();
+      resourceDetails += ec2Text;
+    } catch (e) {
+      console.error("EC2 section failed:", e);
+      resourceDetails += "=== EC2 ===\nError collecting EC2 utilization.\n\n";
     }
+
+    try {
+      const { text: ddbText, estimatedMonthlyCost } = await buildDynamoSection();
+      resourceDetails += ddbText;
+      ddbEstimatedMonthlyCost = estimatedMonthlyCost;
+    } catch (e) {
+      console.error("Dynamo section failed:", e);
+      resourceDetails +=
+        "=== DynamoDB ===\nError collecting DynamoDB utilization.\n\n";
+    }
+
+    // 3) Build Slack text now that we have everything
 
     let slackText =
       `*AWS Cost – Top ${topServices.length} services (last 7 days)*\n` +
@@ -167,18 +451,11 @@ export const handler = async (event, context) => {
       slackText += `• *${entry.service}*: $${entry.amount.toFixed(4)}\n`;
     }
 
-    // 2) Bonus: by TAG (Project/Env/etc.), if COST_TAG_KEY is configured
+    // Billing view – by tag (e.g. Project)
     if (COST_TAG_KEY) {
       try {
         const { arr: tagArr } = await getCostByTagLast7Days(COST_TAG_KEY);
         const topTags = tagArr.slice(0, 10);
-
-        console.log(
-          `=== AWS COST HYGIENE GUARD - Top tag values for ${COST_TAG_KEY} (last 7 days) ===`
-        );
-        for (const entry of topTags) {
-          console.log(`${entry.value.padEnd(40)} $${entry.amount.toFixed(4)}`);
-        }
 
         slackText += `\n*Top ${topTags.length} tag values – \`${COST_TAG_KEY}\` (last 7 days)*\n`;
         for (const entry of topTags) {
@@ -186,20 +463,36 @@ export const handler = async (event, context) => {
         }
       } catch (tagErr) {
         console.error("Error getting tag breakdown:", tagErr);
-        slackText += `\n_(Tag breakdown failed for \`${COST_TAG_KEY}\` – see Lambda logs.)_`;
+        slackText += `\n_(Tag breakdown failed for \`${COST_TAG_KEY}\` – see Lambda logs.)_\n`;
       }
+    }
+
+    // Optional high-level Dynamo estimate from per-table analysis
+    if (ddbEstimatedMonthlyCost !== null) {
+      slackText += `\n*Estimated DynamoDB monthly total (per-table usage & size):* ~$${ddbEstimatedMonthlyCost.toFixed(
+        2
+      )}\n`;
+    }
+
+    // Append detailed resource view as a code block
+    if (resourceDetails) {
+      slackText += `\n\`\`\`\n${resourceDetails}\n\`\`\``;
     }
 
     await postToSlack(slackText);
 
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        message: "Cost scan complete",
-        range: timePeriod,
-        topServices,
-        tagKey: COST_TAG_KEY,
-      }),
+      body: JSON.stringify(
+        {
+          message: "Cost & utilization scan complete",
+          range: timePeriod,
+          topServices,
+          tagKey: COST_TAG_KEY,
+        },
+        null,
+        2
+      ),
     };
   } catch (err) {
     console.error("Error in cost scanner:", err);
