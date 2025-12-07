@@ -1,0 +1,24 @@
+{
+  "name": "aws-cost-hygiene-guard",
+  "version": "1.0.0",
+  "description": "Serverless AWS cost and hygiene auditor (using Lambda and EventBridge) that scans for waste and emails/Slacks a report\r _WIP personal AWS portfolio project_",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DmoneyLuffey/aws-cost-hygiene-guard.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/DmoneyLuffey/aws-cost-hygiene-guard/issues"
+  },
+  "homepage": "https://github.com/DmoneyLuffey/aws-cost-hygiene-guard#readme",
+  "dependencies": {
+    "@aws-sdk/client-cost-explorer": "^3.946.0"
+  }
+}
